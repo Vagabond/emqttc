@@ -50,6 +50,7 @@
          sync_subscribe/2, sync_subscribe/3,
          unsubscribe/2,
          ping/1,
+         puback/2,
          disconnect/1]).
 
 -behaviour(gen_fsm).
@@ -85,6 +86,7 @@
                    | ssl | {ssl, [ssl:ssloption()]}
                    | {logger, atom() | {atom(), atom()}}
                    | auto_resub
+                   | manual_puback
                    | {reconnect, non_neg_integer() | {non_neg_integer(), non_neg_integer()} | false}.
 
 -type mqtt_qosopt() :: qos0 | qos1 | qos2 | mqtt_qos().
@@ -113,6 +115,7 @@
                 connack_tref        :: reference(),
                 transport = tcp     :: tcp | ssl,
                 reconnector         :: emqttc_reconnector:reconnector() | undefined,
+                manual_puback = false  :: boolean(),
                 logger              :: gen_logger:logmod(),
                 tcp_opts            :: [gen_tcp:connect_option()],
                 ssl_opts            :: [ssl:ssloption()]}).
@@ -344,6 +347,15 @@ ping(Client) ->
     gen_fsm:sync_send_event(Client, {self(), ping}, ?SYNC_SEND_TIMEOUT*1000).
 
 %%------------------------------------------------------------------------------
+%% @doc Manually acknowledge publish message.
+%% @end
+%%------------------------------------------------------------------------------
+-spec puback(Client, PacketId) -> ok when Client :: pid() | atom(),
+                                          PacketId :: integer().
+puback(Client, PacketId) ->
+    gen_fsm:send_event(Client, {puback, PacketId}).
+
+%%------------------------------------------------------------------------------
 %% @doc Disconnect from broker.
 %% @end
 %%------------------------------------------------------------------------------
@@ -417,6 +429,8 @@ init([{ssl, SslOpts} | Opts], State) ->
     init(Opts, State#state{transport = ssl, ssl_opts = SslOpts});
 init([auto_resub | Opts], State) ->
     init(Opts, State#state{auto_resub= true});
+init([manual_puback | Opts], State) ->
+    init(Opts, State#state{manual_puback= true});
 init([{logger, Cfg} | Opts], State) ->
     init(Opts, State#state{logger = gen_logger:new(Cfg)});
 init([{keepalive, Time} | Opts], State) ->
@@ -639,6 +653,10 @@ connected(Packet = ?PACKET(_Type), State = #state{name = Name, logger = Logger})
     Logger:debug("[Client ~s] RECV: ~s", [Name, emqttc_packet:dump(Packet)]),
     {ok, NewState} = received(Packet, State),
     next_state(connected, NewState);
+
+connected({puback, PacketId}, State = #state{manual_puback = true}) ->
+    emqttc_protocol:puback(PacketId, State#state.proto_state),
+    next_state(connected, State);
 
 connected(Event, State = #state{name = Name, logger = Logger}) ->
     Logger:warning("[Client ~s] Unexpected Event: ~p, when broker connected!", [Name, Event]),
@@ -969,6 +987,12 @@ pending(Event, State = #state{pending_pubsub = Pending}) ->
 %%------------------------------------------------------------------------------
 received(?PUBLISH_PACKET(?QOS_0, Topic, undefined, Payload), State) ->
     dispatch({publish, self(), Topic, Payload}, State),
+    {ok, State};
+
+received(?PUBLISH_PACKET(?QOS_1, Topic, PacketId, Payload), State = #state{ manual_puback = true}) ->
+
+    dispatch({publish, self(), Topic, {PacketId, Payload}}, State),
+
     {ok, State};
 
 received(Packet = ?PUBLISH_PACKET(?QOS_1, Topic, _PacketId, Payload), State = #state{proto_state = ProtoState}) ->
